@@ -2579,30 +2579,28 @@ impl RouterTrait for Router {
             request_builder = request_builder.json(&body);
         }
 
-        // Add authorization if configured
-        if self.epd.is_some() {
-            if let Some(headers) = headers {
-                for (name, value) in headers {
-                    // When a backend api_key is configured it must win:
-                    // RequestBuilder::header appends, and vLLM reads the
-                    // first Authorization value.
-                    if self.api_key.is_some() && name == http::header::AUTHORIZATION {
-                        continue;
-                    }
-                    if !matches!(
-                        name.as_str(),
-                        "host"
-                            | "content-length"
-                            | "content-type"
-                            | "connection"
-                            | "transfer-encoding"
-                    ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
-                    {
-                        request_builder = request_builder.header(name, value);
-                    }
+        // Forward the client's headers, the way the typed paths do. This must
+        // not be tied to EPD routing: without it a transparent route such as
+        // /v1/responses or /v1/messages reaches an authenticated worker with no
+        // credential at all, while the same header works on /v1/chat/completions.
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                // When a backend api_key is configured it must win:
+                // RequestBuilder::header appends, and vLLM reads the
+                // first Authorization value.
+                if self.api_key.is_some() && name == http::header::AUTHORIZATION {
+                    continue;
+                }
+                if !matches!(
+                    name.as_str(),
+                    "host" | "content-length" | "content-type" | "connection" | "transfer-encoding"
+                ) && !header_utils::TRACE_HEADER_NAMES.contains(&name.as_str())
+                {
+                    request_builder = request_builder.header(name, value);
                 }
             }
         }
+        // Add authorization if configured
         if let Some(ref key) = self.api_key {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
         }
@@ -3044,6 +3042,102 @@ mod tests {
                 "{exported}"
             );
         }
+        server.abort();
+    }
+
+    /// A backend that echoes every header it received, keeping repeats, so a
+    /// test can see exactly what left the router.
+    async fn spawn_header_echo_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::Json;
+        let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let mut echoed: HashMap<String, Vec<String>> = HashMap::new();
+            for (name, value) in headers.iter() {
+                if let Ok(value) = value.to_str() {
+                    echoed
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(value.to_string());
+                }
+            }
+            Json(echoed)
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address, server)
+    }
+
+    fn router_pointing_at(address: std::net::SocketAddr) -> Router {
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(Arc::new(BasicWorker::new(
+            format!("http://{address}"),
+            WorkerType::Regular,
+        )));
+        router
+    }
+
+    async fn echoed_headers(response: Response) -> HashMap<String, Vec<String>> {
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Transparent routes are the fallback for everything without a typed
+    /// handler, so they have to carry the client's own headers. Before this
+    /// the forwarding loop only ran with EPD enabled, and /v1/responses and
+    /// /v1/messages reached the worker unauthenticated.
+    #[tokio::test]
+    async fn transparent_route_forwards_client_headers() {
+        let (address, server) = spawn_header_echo_backend().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer client-token".parse().unwrap());
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        headers.insert("x-session-id", "sticky-1".parse().unwrap());
+        headers.insert("host", "client-controlled.example".parse().unwrap());
+        headers.insert("connection", "X-Internal".parse().unwrap());
+
+        for path in ["/v1/messages", "/v1/responses"] {
+            let response = router_pointing_at(address)
+                .route_transparent(
+                    Some(&headers),
+                    path,
+                    &Method::POST,
+                    serde_json::json!({"model": "m", "max_tokens": 8}),
+                )
+                .await;
+            let echoed = echoed_headers(response).await;
+            assert_eq!(echoed["authorization"], vec!["Bearer client-token"]);
+            assert_eq!(echoed["anthropic-version"], vec!["2023-06-01"]);
+            assert_eq!(echoed["x-session-id"], vec!["sticky-1"]);
+            // The worker must not be told it is someone else's host.
+            assert_eq!(echoed["host"], vec![address.to_string()]);
+            assert!(!echoed.contains_key("connection"));
+        }
+        server.abort();
+    }
+
+    /// A configured `--api-key` is the router's own worker credential and has
+    /// to replace the client's, not be appended next to it: vLLM reads the
+    /// first Authorization value.
+    #[tokio::test]
+    async fn transparent_route_prefers_configured_worker_api_key() {
+        let (address, server) = spawn_header_echo_backend().await;
+        let mut router = router_pointing_at(address);
+        router.api_key = Some("backend-key".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer client-token".parse().unwrap());
+
+        let response = router
+            .route_transparent(
+                Some(&headers),
+                "/v1/responses",
+                &Method::POST,
+                serde_json::json!({"model": "m"}),
+            )
+            .await;
+        let echoed = echoed_headers(response).await;
+        assert_eq!(echoed["authorization"], vec!["Bearer backend-key"]);
         server.abort();
     }
 
