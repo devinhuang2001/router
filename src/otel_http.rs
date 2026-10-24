@@ -165,7 +165,7 @@ mod tests {
         headers.insert("baggage", "private=value".parse().unwrap());
         headers.insert("tracestate", "vendor=value".parse().unwrap());
         let request = propagate_trace_headers(
-            reqwest::Client::new().get("http://worker.example/"),
+            reqwest::Client::new().get("https://worker.example/"),
             Some(&headers),
         )
         .build()
