@@ -3103,7 +3103,10 @@ mod tests {
                     route: "/v1/chat/completions",
                     worker_url: &worker_url,
                     is_stream: false,
-                    load_incremented: false,
+                    // No worker is tracked, so this dispatch does not count against
+                    // a worker's load — the same state the old `load_incremented:
+                    // false` expressed before the field became a guard.
+                    load: RequestLoadGuard::new(None, None),
                     prepared: None,
                 },
                 None,
