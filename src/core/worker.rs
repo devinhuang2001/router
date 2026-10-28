@@ -288,6 +288,9 @@ pub struct WorkerMetadata {
 pub struct BasicWorker {
     metadata: WorkerMetadata,
     load_counter: Arc<AtomicUsize>,
+    /// Pre-built gauge key: load transitions happen twice per request, so the
+    /// label must not be rebuilt (and allocated) on every one of them.
+    load_gauge_key: metrics::Key,
     processed_counter: Arc<AtomicUsize>,
     healthy: Arc<AtomicBool>,
     consecutive_failures: Arc<AtomicUsize>,
@@ -327,6 +330,7 @@ impl BasicWorker {
         Self {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
+            load_gauge_key: RouterMetrics::worker_load_key(&url),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
@@ -457,19 +461,29 @@ impl Worker for BasicWorker {
     }
 
     fn increment_load(&self) {
-        self.load_counter.fetch_add(1, Ordering::Relaxed);
+        let load = self.load_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        RouterMetrics::set_worker_load_by_key(&self.load_gauge_key, load);
     }
 
     fn decrement_load(&self) {
-        self.load_counter
+        // Only publish the load that this call actually released: a saturating
+        // decrement at zero has nothing to report and must not write the gauge.
+        let mut released = None;
+        let _ = self
+            .load_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(1)
-            })
-            .ok();
+                let next = current.checked_sub(1)?;
+                released = Some(next);
+                Some(next)
+            });
+        if let Some(load) = released {
+            RouterMetrics::set_worker_load_by_key(&self.load_gauge_key, load);
+        }
     }
 
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
+        RouterMetrics::set_worker_load_by_key(&self.load_gauge_key, 0);
     }
 
     fn processed_requests(&self) -> usize {
@@ -971,6 +985,62 @@ mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
+
+    /// The load gauge is the only externally visible signal for load-accounting
+    /// drift; it must follow every transition of the counter.
+    #[test]
+    fn worker_load_gauge_tracks_every_transition() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://gauge-worker:8000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let rendered_load = |handle: &metrics_exporter_prometheus::PrometheusHandle| {
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with("vllm_router_worker_load{"))
+                .map(str::to_string)
+        };
+
+        assert!(
+            rendered_load(&handle).is_none(),
+            "an untouched worker must not publish a load sample"
+        );
+
+        worker.increment_load();
+        worker.increment_load();
+        assert_eq!(
+            rendered_load(&handle).as_deref(),
+            Some("vllm_router_worker_load{worker=\"http://gauge-worker:8000\"} 2")
+        );
+
+        worker.decrement_load();
+        assert_eq!(
+            rendered_load(&handle).as_deref(),
+            Some("vllm_router_worker_load{worker=\"http://gauge-worker:8000\"} 1")
+        );
+
+        worker.decrement_load();
+        assert_eq!(
+            rendered_load(&handle).as_deref(),
+            Some("vllm_router_worker_load{worker=\"http://gauge-worker:8000\"} 0")
+        );
+
+        // A saturating decrement at zero releases nothing and must keep the
+        // published load at zero rather than going negative.
+        worker.decrement_load();
+        assert_eq!(
+            rendered_load(&handle).as_deref(),
+            Some("vllm_router_worker_load{worker=\"http://gauge-worker:8000\"} 0")
+        );
+        assert_eq!(worker.load(), 0);
+    }
 
     // Test WorkerType
     #[test]

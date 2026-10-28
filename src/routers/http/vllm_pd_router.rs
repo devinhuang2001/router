@@ -1489,8 +1489,9 @@ impl VllmPDRouter {
             path
         );
 
-        // Increment prefill load at the start of the prefill phase
-        prefill_worker.increment_load();
+        // The prefill reservation lives in a guard, so it is released on
+        // cancellation and panic unwind as well as on the error returns below.
+        let prefill_load = WorkerLoadGuard::new(prefill_worker.as_ref());
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1585,7 +1586,6 @@ impl VllmPDRouter {
         {
             Ok(resp) => resp,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1604,7 +1604,6 @@ impl VllmPDRouter {
         );
 
         if !prefill_response.status().is_success() {
-            prefill_worker.decrement_load();
             let status = prefill_response.status();
             let content_type = prefill_response
                 .headers()
@@ -1634,7 +1633,6 @@ impl VllmPDRouter {
         let prefill_bytes = match prefill_response.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1664,7 +1662,6 @@ impl VllmPDRouter {
         let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
             Ok(json) => json,
             Err(e) => {
-                prefill_worker.decrement_load();
                 let duration = start_time.elapsed();
                 RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                 RouterMetrics::record_pd_request(path);
@@ -1682,7 +1679,6 @@ impl VllmPDRouter {
                 .get("kv_transfer_params")
                 .is_some_and(Value::is_object)
         {
-            prefill_worker.decrement_load();
             self.stop_profiling(&prefill_base_url).await;
             let duration = start_time.elapsed();
             RouterMetrics::record_pd_prefill_error(&prefill_base_url);
@@ -1706,7 +1702,7 @@ impl VllmPDRouter {
         self.stop_profiling(&prefill_base_url).await;
 
         // Prefill is complete; the caller still holds the decode reservation.
-        prefill_worker.decrement_load();
+        drop(prefill_load);
 
         debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
 
@@ -1922,7 +1918,7 @@ impl VllmPDRouter {
             )
         };
 
-        prefill_worker.increment_load();
+        let prefill_load = WorkerLoadGuard::new(prefill_worker.as_ref());
         self.start_profiling(&prefill_base_url).await;
         self.start_profiling(&decode_base_url).await;
 
@@ -1949,7 +1945,6 @@ impl VllmPDRouter {
             ),
         );
 
-        prefill_worker.decrement_load();
         self.stop_profiling(&prefill_base_url).await;
 
         let prefill_response_json = match prefill_result {
@@ -1997,6 +1992,9 @@ impl VllmPDRouter {
                 });
             }
         };
+        // The prefill reservation covers reading the prefill body, not only the
+        // dispatch that produced its response headers.
+        drop(prefill_load);
         if let Some(prefill_json) = prefill_response_json.as_ref() {
             self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, prefill_json);
         }
@@ -4363,11 +4361,179 @@ mod tests {
             let _ = task.await;
             assert_eq!(decode.load(), 0, "decode reservation cancellation: {path}");
             assert_eq!(
+                prefill.load(),
+                0,
+                "prefill load must be released when the request is cancelled: {path}"
+            );
+            assert_eq!(
                 pending_load, 1,
                 "selected decode must be visible before prefill completes: {path}"
             );
         }
     }
+    /// Cancelling the concurrent P/D dispatch while both stages wait for their
+    /// response headers must release this request's prefill reservation and
+    /// leave the reservation of another in-flight request untouched.
+    #[tokio::test]
+    async fn concurrent_prefill_cancellation_releases_only_this_request_load() {
+        let prefill_entered = Arc::new(tokio::sync::Notify::new());
+        let decode_entered = Arc::new(tokio::sync::Notify::new());
+        let prefill_signal = prefill_entered.clone();
+        let prefill_url = spawn_test_server(axum::Router::new().fallback(move || {
+            let signal = prefill_signal.clone();
+            async move {
+                signal.notify_one();
+                std::future::pending::<StatusCode>().await
+            }
+        }))
+        .await;
+        let decode_signal = decode_entered.clone();
+        let decode_url = spawn_test_server(axum::Router::new().fallback(move || {
+            let signal = decode_signal.clone();
+            async move {
+                signal.notify_one();
+                std::future::pending::<StatusCode>().await
+            }
+        }))
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+
+        // A second request stays in flight for the whole test, so an
+        // implementation that zeroes the counter instead of releasing its own
+        // reservation cannot pass.
+        let other_prefill = WorkerLoadGuard::new(prefill.as_ref());
+        let other_decode = WorkerLoadGuard::new(decode.as_ref());
+
+        let router = test_vllm_pd_router();
+        let request_prefill = prefill.clone();
+        let request_decode = decode.clone();
+        let request = tokio::spawn(async move {
+            router
+                .process_concurrent_two_stage(
+                    json!({"model": "test", "messages": []}),
+                    json!({"model": "test", "messages": []}),
+                    request_prefill,
+                    request_decode,
+                    "cancelled-request".to_string(),
+                    "/v1/chat/completions",
+                    None,
+                    Instant::now(),
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(prefill_entered.notified(), decode_entered.notified());
+        })
+        .await
+        .expect("both stages must reach their workers");
+        assert_eq!(
+            prefill.load(),
+            2,
+            "the pending request must hold a prefill reservation"
+        );
+        assert_eq!(decode.load(), 1);
+
+        request.abort();
+        let _ = request.await;
+        assert_eq!(
+            prefill.load(),
+            1,
+            "cancelling must release this request's prefill reservation only"
+        );
+        drop(other_prefill);
+        drop(other_decode);
+        assert_eq!(prefill.load(), 0);
+    }
+
+    /// A prefill worker that returns its response headers and then never yields
+    /// a body chunk still owns the prefill reservation. The decode stage is the
+    /// clock: once it completes, the concurrent dispatch has returned and the
+    /// prefill stage is necessarily blocked on its response body.
+    #[tokio::test]
+    async fn concurrent_prefill_load_covers_stalled_response_body() {
+        use bytes::Bytes;
+        use std::convert::Infallible;
+
+        let prefill_url = spawn_test_server(axum::Router::new().fallback(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures_util::stream::pending::<
+                    Result<Bytes, Infallible>,
+                >()))
+                .unwrap()
+        }))
+        .await;
+        let decode_finished = Arc::new(tokio::sync::Notify::new());
+        let signal = decode_finished.clone();
+        let decode_url = spawn_test_server(axum::Router::new().fallback(move || {
+            let signal = signal.clone();
+            async move {
+                signal.notify_one();
+                (StatusCode::OK, "{\"choices\":[]}")
+            }
+        }))
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            prefill_url,
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(decode_url, WorkerType::Decode));
+        let other_prefill = WorkerLoadGuard::new(prefill.as_ref());
+
+        let router = test_vllm_pd_router();
+        let request_prefill = prefill.clone();
+        let request_decode = decode.clone();
+        let request = tokio::spawn(async move {
+            router
+                .process_concurrent_two_stage(
+                    json!({"model": "test", "messages": []}),
+                    json!({"model": "test", "messages": []}),
+                    request_prefill,
+                    request_decode,
+                    "stalled-body-request".to_string(),
+                    "/v1/chat/completions",
+                    None,
+                    Instant::now(),
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            decode_finished.notified(),
+        )
+        .await
+        .expect("the decode stage must complete");
+        // Both dispatches have returned by now, so the prefill stage is reading
+        // its body. Wait for that state to settle before sampling the counter.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            prefill.load(),
+            2,
+            "the prefill reservation must outlive the response headers while the body is still being read"
+        );
+
+        request.abort();
+        let _ = request.await;
+        assert_eq!(
+            prefill.load(),
+            1,
+            "cancelling mid-body must release this request's prefill reservation only"
+        );
+        drop(other_prefill);
+        assert_eq!(prefill.load(), 0);
+    }
+
     #[test]
     fn test_decode_reservation_serializes_concurrent_admission() {
         let router = test_vllm_pd_router();
@@ -4478,6 +4644,11 @@ mod tests {
             "the NIXL fast path must reuse the reservation"
         );
         assert_eq!(decode.load(), 0);
+        assert_eq!(
+            prefill.load(),
+            0,
+            "cancellation must release the prefill reservation on the NIXL fast path"
+        );
     }
 
     #[tokio::test]
