@@ -46,8 +46,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
+
+/// Number of upstream body chunks the Router is willing to hold on behalf of a
+/// client that is not reading.
+///
+/// The forwarding task hands bytes over one chunk at a time, so this queue is
+/// the only Router-owned buffer on a streaming response. When it is unbounded
+/// the task pulls from the worker as fast as the worker produces, no matter how
+/// fast the client reads, and a stalled reader turns into unbounded memory.
+pub(crate) const SSE_FORWARD_QUEUE_CHUNKS: usize = 8;
 
 fn prepare_error_status(error: &PrepareError) -> StatusCode {
     match error {
@@ -75,13 +84,13 @@ fn http_stages_json(http_ttfb_ms: f64, first_sse_ms: f64) -> serde_json::Value {
     })
 }
 
-fn emit_http_first_sse<E>(
-    tx: &tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, E>>,
+async fn emit_http_first_sse<E>(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, E>>,
     stages: &serde_json::Value,
 ) {
     let comment = format!(": router-stages {stages}\n\n");
     info!(%stages, "http proxy stages");
-    let _ = tx.send(Ok(bytes::Bytes::from(comment)));
+    let _ = tx.send(Ok(bytes::Bytes::from(comment))).await;
 }
 
 struct LoadTrackedBody {
@@ -1914,7 +1923,7 @@ impl Router {
             }
 
             let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = tokio::sync::mpsc::channel(SSE_FORWARD_QUEUE_CHUNKS);
 
             // Spawn task to forward stream and detect completion
             let producer_load = load.clone();
@@ -1931,7 +1940,7 @@ impl Router {
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
+                                    emit_http_first_sse(&tx, &stages).await;
                                 }
                             }
                             if let Some(completion) = &completion {
@@ -1945,14 +1954,14 @@ impl Router {
                             {
                                 producer_load.release();
                             }
-                            if tx.send(Ok(bytes)).is_err() {
+                            if tx.send(Ok(bytes)).await.is_err() {
                                 stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
                             stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            let _ = tx.send(Err(format!("Stream error: {}", e))).await;
                             break;
                         }
                     }
@@ -1962,7 +1971,7 @@ impl Router {
                 }
             });
 
-            let stream = UnboundedReceiverStream::new(rx);
+            let stream = ReceiverStream::new(rx);
             let body = Body::from_stream(stream);
 
             let mut response = Response::new(body);
@@ -1981,7 +1990,7 @@ impl Router {
             }
 
             let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = tokio::sync::mpsc::channel(SSE_FORWARD_QUEUE_CHUNKS);
             let completion = if status.is_success() {
                 program_completion
             } else {
@@ -2001,20 +2010,20 @@ impl Router {
                                 let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
                                 if stages_on {
                                     let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
+                                    emit_http_first_sse(&tx, &stages).await;
                                 }
                             }
                             if let Some(completion) = &completion {
                                 completion.observe_sse_chunk(&bytes);
                             }
-                            if tx.send(Ok(bytes)).is_err() {
+                            if tx.send(Ok(bytes)).await.is_err() {
                                 stream_succeeded = false;
                                 break;
                             }
                         }
                         Err(e) => {
                             stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            let _ = tx.send(Err(format!("Stream error: {}", e))).await;
                             break;
                         }
                     }
@@ -2024,7 +2033,7 @@ impl Router {
                 }
             });
 
-            let stream = UnboundedReceiverStream::new(rx);
+            let stream = ReceiverStream::new(rx);
             let body = Body::from_stream(stream);
 
             let mut response = Response::new(body);
@@ -3123,7 +3132,7 @@ impl RouterTrait for Router {
                     }
                 } else {
                     let stream = response.bytes_stream();
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (tx, rx) = tokio::sync::mpsc::channel(SSE_FORWARD_QUEUE_CHUNKS);
                     let completion = status.is_success().then_some(program_completion).flatten();
                     tokio::spawn(async move {
                         let mut stream = stream;
@@ -3134,14 +3143,14 @@ impl RouterTrait for Router {
                                     if let Some(completion) = &completion {
                                         completion.observe_sse_chunk(&bytes);
                                     }
-                                    if tx.send(Ok(bytes)).is_err() {
+                                    if tx.send(Ok(bytes)).await.is_err() {
                                         stream_ok = false;
                                         break;
                                     }
                                 }
                                 Err(error) => {
                                     stream_ok = false;
-                                    let _ = tx.send(Err(format!("Stream error: {error}")));
+                                    let _ = tx.send(Err(format!("Stream error: {error}"))).await;
                                     break;
                                 }
                             }
@@ -3151,7 +3160,7 @@ impl RouterTrait for Router {
                         }
                     });
                     response_builder
-                        .body(Body::from_stream(UnboundedReceiverStream::new(rx)))
+                        .body(Body::from_stream(ReceiverStream::new(rx)))
                         .unwrap_or_else(|error| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4429,7 +4438,9 @@ mod tests {
             let _ = finish_rx.await;
         });
         queued_rx.await.unwrap();
-        let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(body_rx)));
+        let mut response = Response::new(Body::from_stream(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(body_rx),
+        ));
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::with_output_frame(
@@ -4586,6 +4597,84 @@ mod tests {
             );
             server.abort();
         }
+    }
+
+    /// A client that does not read must not let the forwarding task drain the
+    /// worker's response into Router memory: the hand-off queue is the only
+    /// Router-owned buffer on a streaming response, so it has to pull the
+    /// worker only as fast as the client consumes.
+    #[tokio::test]
+    async fn streaming_response_pulls_from_the_worker_only_as_the_client_reads() {
+        use axum::routing::post;
+        use std::sync::atomic::AtomicUsize;
+
+        const CHUNK_BYTES: usize = 8 * 1024;
+        const CHUNKS: usize = 8192;
+
+        let produced = Arc::new(AtomicUsize::new(0));
+        let counter = produced.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Regular,
+        ));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    let stream = futures_util::stream::iter(0..CHUNKS).map(move |_| {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b'a'; CHUNK_BYTES]))
+                    });
+                    Response::new(Body::from_stream(stream))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker);
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            }));
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}], "stream": true,
+        }))
+        .unwrap();
+
+        let response = router
+            .route_typed_request(None, &request, "/v1/chat/completions", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Hold the response without reading a single byte of the body.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let buffered_bytes = produced.load(Ordering::Relaxed) * CHUNK_BYTES;
+        assert!(buffered_bytes > 0, "the response never started streaming");
+        // Loopback socket buffers and the client connection's read buffer hold
+        // roughly a megabyte no matter how the queue is sized, so the bar has to
+        // be a byte budget rather than a chunk count: with the queue bounded the
+        // forwarding task parks after 8 chunks and this lands near 1.1 MiB, while
+        // an unbounded hand-off drains tens of megabytes of the 64 MiB response.
+        assert!(
+            buffered_bytes < 8 * 1024 * 1024,
+            "the router pulled {buffered_bytes} bytes of a {} byte response while the client read nothing",
+            CHUNKS * CHUNK_BYTES
+        );
+
+        // Reading the body still yields every byte the worker produced.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), CHUNKS * CHUNK_BYTES);
+        assert!(body.iter().all(|byte| *byte == b'a'));
+        server.abort();
     }
 
     #[tokio::test]

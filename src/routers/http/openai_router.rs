@@ -332,27 +332,29 @@ impl super::super::RouterTrait for OpenAIRouter {
                 }
             }
         } else {
-            // Stream SSE bytes to client
+            // Stream SSE bytes to client, bounded by the same Router-owned queue
+            // the rest of the HTTP path uses: an unbounded hand-off lets this task
+            // pull from the worker faster than the client reads.
             let stream = resp.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = tokio::sync::mpsc::channel(super::router::SSE_FORWARD_QUEUE_CHUNKS);
             tokio::spawn(async move {
                 let mut s = stream;
                 while let Some(chunk) = s.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
+                            if tx.send(Ok(bytes)).await.is_err() {
                                 break;
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
+                            let _ = tx.send(Err(format!("Stream error: {}", e))).await;
                             break;
                         }
                     }
                 }
             });
             let mut response = Response::new(Body::from_stream(
-                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                tokio_stream::wrappers::ReceiverStream::new(rx),
             ));
             *response.status_mut() = status;
             response
