@@ -347,7 +347,10 @@ impl super::super::RouterTrait for OpenAIRouter {
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e))).await;
+                            // Delivered without awaiting: with the queue full the
+                            // client has stopped reading, and parking here would
+                            // keep this task alive for a stream that is over.
+                            let _ = tx.try_send(Err(format!("Stream error: {}", e)));
                             break;
                         }
                     }
