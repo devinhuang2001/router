@@ -518,6 +518,47 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
+    #[test]
+    fn test_take_registered_pod_on_readiness_change() {
+        let registered = PodInfo {
+            name: "worker-a".into(),
+            ip: "10.0.0.7".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: Some(PodType::Prefill),
+            bootstrap_port: Some(9000),
+        };
+        let mut tracker = HashSet::from([registered.clone()]);
+        let mut unready_event = registered.clone();
+        unready_event.is_ready = false;
+        unready_event.status = "Terminating".into();
+        unready_event.pod_type = Some(PodType::Regular);
+        unready_event.bootstrap_port = None;
+
+        assert_eq!(take_registered_pod(&mut tracker, &unready_event), Some(registered));
+        assert!(tracker.is_empty());
+        assert_eq!(take_registered_pod(&mut tracker, &unready_event), None);
+    }
+
+    #[test]
+    fn test_take_registered_pod_does_not_remove_other_ip() {
+        let registered = PodInfo {
+            name: "worker-a".into(),
+            ip: "10.0.0.7".parse().unwrap(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: Some(PodType::Regular),
+            bootstrap_port: None,
+        };
+        let mut tracker = HashSet::from([registered]);
+        let different_ip = PodInfo {
+            ip: "10.0.0.8".parse().unwrap(),
+            ..tracker.iter().next().unwrap().clone()
+        };
+        assert_eq!(take_registered_pod(&mut tracker, &different_ip), None);
+        assert_eq!(tracker.len(), 1);
+    }
+
     // Helper function to create a Pod for testing PodInfo::from_pod
     fn create_k8s_pod(
         name: Option<&str>,
