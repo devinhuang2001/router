@@ -354,6 +354,13 @@ async fn handle_pod_event(
 ) {
     let worker_url = pod_info.worker_url(port);
 
+    // A Pod may lose readiness without a deletion timestamp. Remove its
+    // previously registered worker rather than keeping a stale endpoint.
+    if !pod_info.is_healthy() {
+        handle_pod_deletion(&pod_info, tracked_pods, router, port, pd_mode).await;
+        return;
+    }
+
     // If pod is healthy, try to add it (with atomic check-and-insert)
     if pod_info.is_healthy() {
         // Atomic check-and-insert to prevent race conditions
@@ -425,6 +432,20 @@ async fn handle_pod_event(
     }
 }
 
+// A deletion/update event may have a different readiness, phase or role
+// than the PodInfo stored when the worker was registered. Match its concrete
+// endpoint and use the stored registration data to remove it.
+fn take_registered_pod(tracked: &mut HashSet<PodInfo>, event: &PodInfo) -> Option<PodInfo> {
+    let registered = tracked
+        .iter()
+        .find(|pod| pod.name == event.name && pod.ip == event.ip)
+        .cloned();
+    if let Some(ref pod) = registered {
+        tracked.remove(pod);
+    }
+    registered
+}
+
 async fn handle_pod_deletion(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
@@ -432,9 +453,7 @@ async fn handle_pod_deletion(
     port: u16,
     pd_mode: bool,
 ) {
-    let worker_url = pod_info.worker_url(port);
-
-    let was_tracked = {
+    let registered = {
         let mut tracked = match tracked_pods.lock() {
             Ok(tracked) => tracked,
             Err(e) => {
@@ -442,10 +461,11 @@ async fn handle_pod_deletion(
                 return;
             }
         };
-        tracked.remove(pod_info)
+        take_registered_pod(&mut tracked, pod_info)
     };
 
-    if was_tracked {
+    if let Some(pod_info) = registered {
+        let worker_url = pod_info.worker_url(port);
         info!(
             "Removing pod: {} | type: {:?} | url: {}",
             pod_info.name, pod_info.pod_type, worker_url
@@ -485,8 +505,8 @@ async fn handle_pod_deletion(
         // This case might occur if a pod is deleted before it was ever marked healthy and added.
         // Or if the event is duplicated. No action needed on the router if it wasn't tracked (and thus not added).
         debug!(
-            "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+            "Pod deletion event for untracked/already removed pod: {} (type: {:?}).",
+            pod_info.name, pod_info.pod_type
         );
     }
 }
